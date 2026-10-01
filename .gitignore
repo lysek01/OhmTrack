@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build artifacts
+build/
+build_pyi/
+dist/
+*.spec
+*.exe
+
+# App output / personal data
+ohmtrack_log*.csv
+ut620_log*.csv
+profiles/

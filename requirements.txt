@@ -1,0 +1,8 @@
+# UT620C+ Live — runtime dependencies
+#
+# Windows: NONE. A native HID backend (hid_win.py) uses only the Windows system
+#          libraries and the Python standard library, so nothing needs installing.
+#
+# Linux / macOS (and optional on Windows): the open-source HID library.
+#          This is the libusb/hidapi project — NOT a vendor file.
+hidapi>=0.14 ; sys_platform != "win32"
