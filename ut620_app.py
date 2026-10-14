@@ -33,7 +33,7 @@ from ut620_driver import (UT620, Reading, Status, CMD_LIVE, format_amps,
                           current_for_ohms, band_label_for_ohms)
 
 APP_NAME = "OhmTrack"
-APP_VERSION = "1.0"
+APP_VERSION = "1.0.1"
 AUTHOR = "Martin Lysek"
 AUTHOR_URL = "https://github.com/lysek01"
 
@@ -45,7 +45,7 @@ else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILE_DIR = Path(_APP_DIR) / "profiles"
 
-STATUS_EVERY = 4
+STATUS_PERIOD_S = 2.0   # how often to refresh the meter's range/mode/current
 PLOT_MAXPTS = 20000
 
 THEMES = {
@@ -117,7 +117,9 @@ class Acquirer(threading.Thread):
         self._stop.set()
 
     def run(self):
-        dev, fails, i = None, 0, 0
+        dev, fails = None, 0
+        next_t = time.monotonic()
+        last_status = 0.0
         while not self._stop.is_set():
             if dev is None:
                 try:
@@ -128,6 +130,7 @@ class Acquirer(threading.Thread):
                         return
                     self.out_q.put(("conn", "Connected"))
                     fails = 0
+                    next_t = time.monotonic()
                 except Exception as e:
                     self.out_q.put(("error", str(e)))
                     return
@@ -142,13 +145,29 @@ class Acquirer(threading.Thread):
                     pass
                 dev, fails = None, 0
                 self._stop.wait(1.0)
+                next_t = time.monotonic()
                 continue
-            if i % STATUS_EVERY == 0:
+            # refresh range/mode on a time basis (not every Nth sample) so it stays
+            # light at fast sample rates
+            now = time.monotonic()
+            if now - last_status >= STATUS_PERIOD_S:
                 s = dev.poll_status()
                 if s.ok:
                     self.out_q.put(("meter", s))
-            i += 1
-            self._stop.wait(max(0.05, float(self.interval_provider())))
+                last_status = now
+            # Fixed-rate pacing: keep the AVERAGE period equal to the set interval.
+            # Sleeping the whole interval *after* the work would make each cycle take
+            # interval + work, so the cadence drifts and 1 s timestamps occasionally
+            # skip a second. Here we schedule the next tick instead, so per-cycle work
+            # time does not accumulate into drift.
+            interval = max(0.05, float(self.interval_provider()))
+            next_t += interval
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                if self._stop.wait(delay):
+                    break
+            elif delay < -interval:      # a real stall (reconnect / long read) -> resync
+                next_t = time.monotonic()
         if dev:
             dev.close()
         self.out_q.put(("conn", "Disconnected"))
@@ -831,15 +850,16 @@ class App(tk.Tk):
 
     def _csv_value(self, col, r, temp, t_rel):
         if col == "timestamp":
-            return time.strftime("%Y-%m-%d %H:%M:%S")
+            t = time.time()
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}"
         if col == "t_rel_s":
-            return f"{t_rel:.2f}"
+            return f"{t_rel:.3f}"
         if col == "value":
-            return f"{r.value:g}"
+            return "OL" if r.overload else f"{r.value:g}"
         if col == "unit":
-            return r.unit
+            return "" if r.overload else r.unit
         if col == "ohms":
-            return f"{r.ohms:.9g}"
+            return "" if (r.overload or not math.isfinite(r.ohms)) else f"{r.ohms:.9g}"
         if col == "temperature_C":
             return f"{temp:.4f}" if math.isfinite(temp) else ""
         if col == "current_A":
@@ -930,6 +950,10 @@ class App(tk.Tk):
             self.t_card["sub"].configure(text="")
             self.current_a = None
             self._refresh_meter_line()
+            # still log the row so an over-range stretch doesn't leave a time gap
+            t_rel = time.time() - self.t_start
+            self.history.append((t_rel, float("nan"), float("nan")))
+            self._csv_write(r, float("nan"), t_rel)
             return
         self.current_a = current_for_ohms(r.ohms)
         self._refresh_meter_line()
@@ -955,12 +979,16 @@ class App(tk.Tk):
             self.chart.add(t_rel, v)
             self.chart.redraw()
             self._update_stats()
-        if self.csv_writer:
-            try:
-                self.csv_writer.writerow([self._csv_value(c, r, temp, t_rel) for c in self.csv_columns])
-                self.csv_file.flush()
-            except (OSError, ValueError):
-                self._stop_log()
+        self._csv_write(r, temp, t_rel)
+
+    def _csv_write(self, r, temp, t_rel):
+        if not self.csv_writer:
+            return
+        try:
+            self.csv_writer.writerow([self._csv_value(c, r, temp, t_rel) for c in self.csv_columns])
+            self.csv_file.flush()
+        except (OSError, ValueError):
+            self._stop_log()
 
     def _on_close(self):
         if self.acq:
